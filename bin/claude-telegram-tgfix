@@ -1,0 +1,223 @@
+#!/bin/zsh
+# claude-telegram-keepalive — keep exactly one Claude Code Telegram bot alive on macOS.
+#
+# Why this exists: running the Claude Code Telegram plugin as an always-on bot on
+# a Mac hits three non-obvious failure modes — keychain isolation under
+# SSH/launchd, single-holder token competition (HTTP 409), and silent "send
+# drift" where the bot replies as plain text instead of calling the send tool.
+# See docs/three-failures.md for the full story. This script heals toward the
+# invariant "exactly one healthy bot, and it's really mine."
+#
+# Tested on macOS (zsh). MIT licensed.
+set -euo pipefail
+
+# ---- config (override via environment) --------------------------------------
+SOCKET="${TGFIX_SOCKET:-tgfix}"                 # dedicated tmux socket for the bot
+SESSION="${TGFIX_SESSION:-tg}"                  # tmux session name
+WORKDIR="${TGFIX_WORKDIR:-$HOME}"               # cwd for the bot session
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || echo "$HOME/.local/bin/claude")}"
+PLUGIN="${TGFIX_PLUGIN:-plugin:telegram@claude-plugins-official}"
+PLUGIN_KEY="${TGFIX_PLUGIN_KEY:-telegram@claude-plugins-official}"  # for --settings
+STATE_DIR="${TELEGRAM_STATE_DIR:-$HOME/.claude/channels/telegram}"
+TOKEN_ENV="${CLAUDE_OAUTH_ENV:-$HOME/.claude/claude-code-oauth.env}"  # see Failure 1
+ACTIVE_ACCOUNT="${TGFIX_ACCOUNT_FILE:-$HOME/.claude/claude-telegram-account}"
+SERVER_MATCH="${TGFIX_SERVER_MATCH:-server.ts}" # how to find the plugin's poller
+HEAL_INTERVAL="${TGFIX_HEAL_INTERVAL:-20}"      # seconds between watch heals
+
+usage() {
+  cat <<'USAGE'
+Usage: claude-telegram-tgfix [start|restart|restart-idle|stop|status|watch]
+
+start         Start the bot if absent, leaving an existing healthy session alone.
+restart       Kill stale/default sessions, then start a fresh bot session.
+restart-idle  Daily-cron restart, but skip if the bot is mid-turn (no context wipe).
+stop          Stop the bot session and its Telegram server process.
+status        Print bot session, Claude channel, and Telegram server state.
+watch         Long-running launchd mode: keep exactly one Telegram server alive.
+USAGE
+}
+
+has_session() {
+  tmux -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null
+}
+
+kill_default_claude_session() {
+  # Reap a default-socket "Claude" session ONLY if it is actually a stray
+  # telegram channel bot (claude --channels). A user's own work session that
+  # happens to be named "Claude" (plain `claude`, no --channels flag) is left
+  # completely alone. Conservative by design: when in doubt, do NOT kill — a
+  # missed stray is caught later by stop_extra_channel_claudes.
+  tmux has-session -t Claude 2>/dev/null || return 0
+  local pp p
+  pp="$(tmux list-panes -t Claude -F '#{pane_pid}' 2>/dev/null | head -n1)"
+  [[ -n "$pp" ]] || return 0
+  for p in $pp $(pgrep -P "$pp" 2>/dev/null); do
+    if ps -o command= -p "$p" 2>/dev/null | grep -q -- "--channels $PLUGIN"; then
+      tmux kill-session -t Claude || true
+      return 0
+    fi
+  done
+}
+
+telegram_server_pids() {
+  pgrep -f "$SERVER_MATCH" 2>/dev/null || true
+}
+
+channel_claude_pids() {
+  ps -axo pid=,comm=,args= 2>/dev/null | awk -v plugin="$PLUGIN" '
+    $2 ~ /(^|\/)claude$/ && index($0, "--channels " plugin) { print $1 }
+  '
+}
+
+session_pane_pid() {
+  tmux -L "$SOCKET" list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -n 1
+}
+
+is_descendant_of() {
+  local pid="$1" ancestor="$2" ppid
+  while [[ "$pid" =~ '^[0-9]+$' ]] && (( pid > 1 )); do
+    [[ "$pid" == "$ancestor" ]] && return 0
+    ppid="$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d '[:space:]')"
+    [[ -z "$ppid" ]] && break
+    pid="$ppid"
+  done
+  return 1
+}
+
+healthy() {
+  # The invariant: session exists AND its pane is the channel bot AND there is
+  # EXACTLY ONE server AND that server descends from the pane (not an orphan).
+  local pane_pid pane_cmd servers count server_pid
+  has_session || return 1
+  pane_pid="$(session_pane_pid)"
+  [[ "$pane_pid" =~ '^[0-9]+$' ]] || return 1
+  kill -0 "$pane_pid" 2>/dev/null || return 1
+  pane_cmd="$(ps -p "$pane_pid" -o args= 2>/dev/null || true)"
+  [[ "$pane_cmd" == *"--channels $PLUGIN"* ]] || return 1
+  servers="$(telegram_server_pids)"
+  [[ -z "$servers" ]] && return 1
+  count="$(echo "$servers" | wc -w | tr -d ' ')"
+  [[ "$count" == "1" ]] || return 1
+  server_pid="$(echo "$servers" | awk 'NR == 1 { print $1 }')"
+  is_descendant_of "$server_pid" "$pane_pid"
+}
+
+stop_stale_server() {
+  local pid_file="$STATE_DIR/bot.pid" pids pid
+  pids="$(telegram_server_pids)"
+  for pid in $pids; do kill "$pid" 2>/dev/null || true; done
+  if [[ -r "$pid_file" ]]; then
+    pid="$(command cat "$pid_file" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "$pid" =~ '^[0-9]+$' ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  fi
+  sleep 1
+  pids="$(telegram_server_pids)"
+  for pid in $pids; do
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  done
+}
+
+stop_extra_channel_claudes() {
+  local pane_pid pids pid
+  pane_pid="$(session_pane_pid || true)"
+  pids="$(channel_claude_pids)"
+  for pid in $pids; do
+    [[ -n "$pane_pid" && "$pid" == "$pane_pid" ]] && continue
+    kill "$pid" 2>/dev/null || true
+  done
+  sleep 1
+  for pid in $pids; do
+    [[ -n "$pane_pid" && "$pid" == "$pane_pid" ]] && continue
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  done
+}
+
+stop_session() {
+  has_session && tmux -L "$SOCKET" kill-session -t "$SESSION" || true
+}
+
+start_session() {
+  mkdir -p "$STATE_DIR"
+  # Two tricks live in this one line (see docs/three-failures.md):
+  #  1. `source $TOKEN_ENV` loads a long-lived OAuth token from a file so the bot
+  #     never needs the macOS login keychain (works from SSH / cron / launchd).
+  #  2. `--settings` force-enables the plugin at the flag tier, overriding user
+  #     settings. Keep the plugin GLOBALLY OFF so plain `claude` work sessions
+  #     never grab the single bot slot; only this session opts in.
+  local cmd
+  cmd="[[ -f '$TOKEN_ENV' ]] && source '$TOKEN_ENV'; exec '$CLAUDE_BIN' --channels '$PLUGIN' --settings '{\"enabledPlugins\":{\"$PLUGIN_KEY\":true}}'"
+  tmux -L "$SOCKET" new-session -d -s "$SESSION" -c "$WORKDIR" /bin/zsh -lc "$cmd"
+}
+
+status() {
+  echo "== active token =="
+  [[ -r "$ACTIVE_ACCOUNT" ]] && echo "account: $(tr -d '[:space:]' < "$ACTIVE_ACCOUNT")" || echo "account: none"
+  if [[ -L "$TOKEN_ENV" ]]; then
+    echo "env: $TOKEN_ENV -> $(readlink "$TOKEN_ENV")"
+  elif [[ -e "$TOKEN_ENV" ]]; then
+    echo "env: $TOKEN_ENV (regular file)"
+  else
+    echo "env: missing (will fall back to keychain — see Failure 1)"
+  fi
+  echo "== tmux default =="; tmux ls 2>/dev/null || true
+  echo "== tmux $SOCKET =="; tmux -L "$SOCKET" ls 2>/dev/null || true
+  echo "== Claude telegram channel =="; pgrep -fl "$PLUGIN" 2>/dev/null || true
+  echo "== Telegram server =="; pgrep -fl "$SERVER_MATCH" 2>/dev/null || true
+}
+
+start() {
+  kill_default_claude_session
+  if healthy; then status; return; fi
+  stop_extra_channel_claudes; stop_session; stop_stale_server
+  start_session; sleep 3; status
+}
+
+restart() {
+  kill_default_claude_session
+  stop_extra_channel_claudes; stop_session; stop_stale_server
+  start_session; sleep 3; status
+}
+
+stop_all() { stop_session; stop_stale_server; }
+
+watch() {
+  while true; do
+    kill_default_claude_session
+    if ! healthy; then
+      stop_extra_channel_claudes; stop_session; stop_stale_server; start_session
+    fi
+    sleep "$HEAL_INTERVAL"
+  done
+}
+
+restart_if_idle() {
+  # Daily "freshness" restart that NEVER wipes an active conversation. Long-running
+  # bot sessions drift (start replying as plain text instead of calling the send
+  # tool); a periodic fresh session resets channel state and clears the drift.
+  # "esc to interrupt" only renders during an interruptible turn, so its presence
+  # == bot is mid-turn → skip (caught next run). Absent / no session == safe.
+  local ts pane
+  ts="$(date '+%F %T')"
+  if has_session; then
+    pane="$(tmux -L "$SOCKET" capture-pane -t "$SESSION" -p 2>/dev/null || true)"
+    if echo "$pane" | grep -q 'esc to interrupt'; then
+      echo "$ts restart-idle: bot mid-turn, skipping (will retry next run)"
+      return 0
+    fi
+  fi
+  echo "$ts restart-idle: idle -> restarting for freshness"
+  restart
+}
+
+case "${1:-status}" in
+  start) start ;;
+  restart) restart ;;
+  restart-idle) restart_if_idle ;;
+  stop) stop_all ;;
+  status) status ;;
+  watch) watch ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 2 ;;
+esac

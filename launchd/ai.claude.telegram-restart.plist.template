@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.claude.telegram-restart</string>
+
+  <!-- Daily freshness restart (idle-guarded) to clear "send drift" — Failure 3. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/claude-telegram-tgfix</string>
+    <string>restart-idle</string>
+  </array>
+
+  <!-- Pick an hour you're unlikely to be mid-conversation. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>5</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>SHELL</key>
+    <string>/bin/zsh</string>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/claude-telegram-restart.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/claude-telegram-restart.err.log</string>
+</dict>
+</plist>

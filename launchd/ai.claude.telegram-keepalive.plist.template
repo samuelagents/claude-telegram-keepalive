@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.claude.telegram-keepalive</string>
+
+  <!-- The heal loop: keep exactly one healthy bot alive, forever. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/claude-telegram-tgfix</string>
+    <string>watch</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- launchd starts with a minimal environment — declare what the bot needs.
+       This is the same "you are not in your login session" lesson as Failure 1. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>SHELL</key>
+    <string>/bin/zsh</string>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/claude-telegram-keepalive.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/claude-telegram-keepalive.err.log</string>
+</dict>
+</plist>

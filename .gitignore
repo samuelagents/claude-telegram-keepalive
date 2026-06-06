@@ -1,0 +1,7 @@
+# never commit a real token file
+claude-code-oauth.env
+*.env
+
+# macOS / logs / editor cruft
+.DS_Store
+*.log
